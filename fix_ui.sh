@@ -1,3 +1,10 @@
+#!/bin/bash
+
+echo "=========================================="
+echo " PHASE 26: WIRING THE FRONTEND UI         "
+echo "=========================================="
+
+cat << 'INNER_EOF' > frontend/src/App.jsx
 import { useState } from 'react';
 
 function App() {
@@ -74,3 +81,6 @@ function App() {
   );
 }
 export default App;
+INNER_EOF
+
+echo "UI Fixed! Run ./launch_codex.sh again to see the terminal output live in the browser."

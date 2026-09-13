@@ -7,7 +7,8 @@ class AutonomyLevel(str, Enum):
     HIGH = "high"
 
 class Settings(BaseSettings):
-    WORKSPACE_ROOT: str = "."
+    # CRITICAL FIX: The AI is now permanently restricted to this folder.
+    WORKSPACE_ROOT: str = "./isolated_workspace"
     DATABASE_URL: str = "sqlite:///./codex.db"
     LOG_LEVEL: str = "INFO"
     AUTONOMY_LEVEL: AutonomyLevel = AutonomyLevel.MEDIUM

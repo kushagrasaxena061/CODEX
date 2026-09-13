@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Greeting</title>
+</head>
+<body>
+    <h1 id="greeting"></h1>
+
+    <script>
+        fetch('http://localhost:8080')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('greeting').textContent = data.greeting;
+            })
+            .catch(error => console.error('Error fetching greeting:', error));
+    </script>
+</body>
+</html>

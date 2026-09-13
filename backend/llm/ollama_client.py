@@ -1,52 +1,43 @@
-import httpx
-import logging
+import aiohttp
 import json
-from typing import Dict, Any
+import logging
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-async def check_ollama_health() -> str:
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_BASE_URL}/api/tags")
-            resp.raise_for_status()
-            return "online"
-    except Exception:
-        return "offline"
-
-async def generate_json(prompt: str, model: str, system: str = "") -> Dict[str, Any]:
-    """Robust Ollama client with timeout, JSON enforcement, and error handling."""
+async def generate_json(prompt: str, model: str, system_prompt: str = "") -> dict:
     url = f"{settings.OLLAMA_BASE_URL}/api/generate"
     payload = {
         "model": model,
         "prompt": prompt,
-        "system": system,
+        "system": system_prompt,
+        "format": "json",
         "stream": False,
-        "format": "json"
+        "options": {"temperature": 0.1}
     }
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            
-            data = response.json()
-            response_text = data.get("response", "{}")
-            
-            try:
-                return json.loads(response_text)
-            except json.JSONDecodeError:
-                logger.error(f"Ollama returned malformed JSON: {response_text}")
-                return {"error": "Malformed JSON", "raw": response_text}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=120) as response:
+                if response.status != 200:
+                    return {"error": f"Ollama HTTP {response.status}"}
                 
-    except httpx.ConnectError:
-        return {"error": "Connection failed. Is Ollama running on port 11434?"}
-    except httpx.TimeoutException:
-        return {"error": "Ollama request timed out."}
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return {"error": f"Model '{model}' not found. You must pull it."}
-        return {"error": f"HTTP {e.response.status_code}"}
+                result = await response.json()
+                
+                # Extract actual token metrics for DARWIN benchmark
+                input_tokens = result.get("prompt_eval_count", 0)
+                output_tokens = result.get("eval_count", 0)
+                latency = result.get("total_duration", 0) / 1e9 # Convert nanoseconds to seconds
+                
+                try:
+                    parsed_response = json.loads(result["response"])
+                    parsed_response["_benchmark"] = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "latency_seconds": round(latency, 2)
+                    }
+                    return parsed_response
+                except json.JSONDecodeError:
+                    return {"error": "Invalid JSON returned from model."}
     except Exception as e:
         return {"error": str(e)}

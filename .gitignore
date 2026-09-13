@@ -1,22 +1,6 @@
-# Environment and Cache
-venv/
-env/
 .env
+.venv/
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Local Databases and Vector Indices
-data/
-*.pkl
-*.sqlite3
-
-# Uploaded Files and Reports
-*.pdf
-rag_telemetry_*.json
-rag_report_*.md
-
-# OS and IDE Files
-.DS_Store
-.idea/
-.vscode/
+*.pyc
+codex.db
+node_modules/

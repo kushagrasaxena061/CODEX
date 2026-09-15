@@ -1,4 +1,4 @@
-import logging, os, shutil, zipfile, tempfile, subprocess, platform
+import logging, os, shutil, zipfile, tempfile
 from typing import Optional
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
@@ -20,20 +20,37 @@ from backend.llm.ollama_client import generate_json
 from backend.execution.context import current_session_id
 
 logger = logging.getLogger(__name__)
-
 run_migration()
 Base.metadata.create_all(bind=engine)
 
-try:
-    db_gen = get_db()
-    db = next(db_gen)
-    orphans = db.query(Task).filter(Task.status == "WORKING").all()
-    for t in orphans:
-        t.status = "ERROR"
-        t.context_summary = "System unexpectedly shut down during execution. Task aborted."
-    db.commit()
-except Exception as e:
-    logger.warning(f"Could not clean orphaned tasks: {e}")
+# FINAL PRODUCTION FIX: Clean up orphaned working tasks on server boot
+def cleanup_orphans():
+    from backend.database.connection import SessionLocal
+    db = SessionLocal()
+    try:
+        orphans = db.query(Task).filter(Task.status == "WORKING").all()
+        for t in orphans:
+            t.status = "ERROR"
+            t.context_summary = "System unexpectedly shut down during execution. Task aborted."
+        db.commit()
+    finally:
+        db.close()
+cleanup_orphans()
+
+
+# FINAL PRODUCTION FIX: Clean up orphaned working tasks on server boot
+def cleanup_orphans():
+    from backend.database.connection import SessionLocal
+    db = SessionLocal()
+    try:
+        orphans = db.query(Task).filter(Task.status == "WORKING").all()
+        for t in orphans:
+            t.status = "ERROR"
+            t.context_summary = "System unexpectedly shut down during execution. Task aborted."
+        db.commit()
+    finally:
+        db.close()
+cleanup_orphans()
 
 router = APIRouter(prefix="/api", tags=["agent"])
 
@@ -53,6 +70,7 @@ class GithubConnectRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     conversation_id: int
+    # THE FIX: Made commit_message optional to prevent silent 422 crashes
     commit_message: Optional[str] = None
 
 class RejectRequest(BaseModel):
@@ -60,48 +78,6 @@ class RejectRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     title: str
-
-class MountRequest(BaseModel):
-    conversation_id: int
-    local_path: str
-
-@router.get("/workspace/pick_folder")
-def pick_local_folder():
-    try:
-        if platform.system() == "Darwin":
-            # Forces the folder picker to appear ON TOP of the active web browser
-            script = '''
-            tell application (path to frontmost application as text)
-                set folderPath to choose folder with prompt "Select Project Folder to Mount"
-                return POSIX path of folderPath
-            end tell
-            '''
-            res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
-            if res.returncode == 0:
-                return {"path": res.stdout.strip()}
-        return {"path": ""}
-    except Exception as e:
-        logger.error(f"Folder picker error: {e}")
-        return {"path": ""}
-
-@router.post("/workspace/mount")
-async def mount_workspace(req: MountRequest, db: Session = Depends(get_db)):
-    current_session_id.set(req.conversation_id)
-    ws = get_session_workspace(req.conversation_id)
-    
-    target_path = os.path.abspath(os.path.expanduser(req.local_path))
-    if not os.path.exists(target_path):
-        raise HTTPException(status_code=400, detail="Local path does not exist.")
-        
-    if os.path.exists(ws):
-        if os.path.islink(ws): os.remove(ws)
-        elif os.path.isdir(ws): shutil.rmtree(ws)
-        else: os.remove(ws)
-        
-    os.symlink(target_path, ws)
-    rag_db.shred_and_embed(ws, req.conversation_id)
-    event_bus.emit("SYSTEM", f"Live mounted local directory: {target_path}", level="SUCCESS")
-    return {"message": "Directory live mounted successfully."}
 
 @router.get("/conversations")
 def list_conversations(db: Session = Depends(get_db)):
@@ -114,10 +90,7 @@ def list_conversations(db: Session = Depends(get_db)):
             db.refresh(initial)
             ws = get_session_workspace(initial.id)
             current_session_id.set(initial.id)
-            try:
-                GitManager(ws).init_repo()
-            except Exception:
-                pass
+            GitManager(ws).init_repo()
             convs = [initial]
         return [{"id": c.id, "title": c.title, "github_connected": bool(c.github_repo_url)} for c in convs]
     except Exception as e:
@@ -125,21 +98,15 @@ def list_conversations(db: Session = Depends(get_db)):
 
 @router.post("/conversations")
 def create_conversation(db: Session = Depends(get_db)):
-    try:
-        count = db.query(Conversation).count()
-        new_conv = Conversation(title=f"Project #{count + 1}")
-        db.add(new_conv)
-        db.commit()
-        db.refresh(new_conv)
-        ws = get_session_workspace(new_conv.id)
-        current_session_id.set(new_conv.id)
-        try:
-            GitManager(ws).init_repo()
-        except Exception:
-            pass
-        return {"id": new_conv.id, "title": new_conv.title, "github_connected": False}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Database/OS error while creating project.")
+    count = db.query(Conversation).count()
+    new_conv = Conversation(title=f"Project #{count + 1}")
+    db.add(new_conv)
+    db.commit()
+    db.refresh(new_conv)
+    ws = get_session_workspace(new_conv.id)
+    current_session_id.set(new_conv.id)
+    GitManager(ws).init_repo()
+    return {"id": new_conv.id, "title": new_conv.title, "github_connected": False}
 
 @router.patch("/conversations/{conv_id}")
 def rename_conversation(conv_id: int, req: RenameRequest, db: Session = Depends(get_db)):
@@ -197,6 +164,7 @@ async def approve_checkpoint(req: ApproveRequest, db: Session = Depends(get_db))
     current_session_id.set(req.conversation_id)
     conv = db.query(Conversation).filter(Conversation.id == req.conversation_id).first()
     
+    # THE FIX: Permanently update Task status in the Database so buttons vanish
     task = db.query(Task).filter(Task.conversation_id == req.conversation_id, Task.status == "PENDING_APPROVAL").order_by(Task.id.desc()).first()
     if task:
         task.status = "COMPLETED"
@@ -204,6 +172,7 @@ async def approve_checkpoint(req: ApproveRequest, db: Session = Depends(get_db))
 
     ws = get_session_workspace(req.conversation_id)
     git = GitManager(ws)
+    
     final_msg = f"Feature: {req.commit_message}" if req.commit_message else "Human-approved feature update."
     git.create_checkpoint(final_msg)
     
@@ -218,6 +187,8 @@ async def approve_checkpoint(req: ApproveRequest, db: Session = Depends(get_db))
 @router.post("/checkpoint/reject")
 async def reject_checkpoint(req: RejectRequest, db: Session = Depends(get_db)):
     current_session_id.set(req.conversation_id)
+    
+    # THE FIX: Permanently update Task status in the Database so buttons vanish
     task = db.query(Task).filter(Task.conversation_id == req.conversation_id, Task.status == "PENDING_APPROVAL").order_by(Task.id.desc()).first()
     if task:
         task.status = "REJECTED"
@@ -290,6 +261,7 @@ async def submit_prompt(req: ChatRequest, db: Session = Depends(get_db)):
     try:
         plan = await generate_plan(req.prompt, history, req.conversation_id, ws)
         
+        # THE FIX: Injecting session_id directly into Orchestrator for Aggressive Context Re-assertion
         orchestrator = TaskOrchestrator(plan, workspace_root=ws, session_id=req.conversation_id, history=history)
         result = await orchestrator.execute()
         

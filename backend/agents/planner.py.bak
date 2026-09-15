@@ -1,0 +1,73 @@
+import logging
+from pydantic import BaseModel, Field
+from typing import List
+from backend.llm.ollama_client import generate_json
+from backend.config.settings import settings
+from backend.repository.scanner import get_repo_tree
+from backend.events.bus import event_bus
+from backend.tools.search import search_web
+
+logger = logging.getLogger(__name__)
+
+class ImplementationStep(BaseModel):
+    agent_role: str = Field(default="Software Developer")
+    instruction: str = Field(default="")
+
+class AdvancedExecutionPlan(BaseModel):
+    feature_already_exists: bool = Field(default=False)
+    duplication_reason: str = Field(default="")
+    goal: str = Field(default="")
+    target_files: List[str] = Field(default_factory=list)
+    implementation_steps: List[ImplementationStep] = Field(default_factory=list)
+    acceptance_criteria: List[str] = Field(default_factory=list)
+    risk_level: str = Field(default="low")
+
+async def generate_plan(raw_prompt: str, history: str = "") -> AdvancedExecutionPlan:
+    event_bus.emit("ARCHITECT", f"Analyzing architecture to validate request...")
+    repo_tree = get_repo_tree(settings.WORKSPACE_ROOT)
+    from backend.repository.rag_manager import rag_db
+    rag_context = rag_db.query_code(raw_prompt)
+
+    
+    # 1. Ask LLM if it needs to search the web for this prompt
+    search_prompt = f"Does the following request require fetching live documentation, latest framework features, or external knowledge from the internet? Request: {raw_prompt}\nOutput ONLY JSON: {{\"needs_search\": true/false, \"query\": \"search query\"}}"
+    search_decision = await generate_json(search_prompt, settings.OLLAMA_MODEL_PLANNING, "Return valid JSON.", max_tokens=100)
+    
+    web_context = ""
+    if search_decision.get("needs_search"):
+        query = search_decision.get("query", raw_prompt)
+        results = search_web(query)
+        web_context = f"\n\nLIVE WEB CONTEXT FOR ACCURACY:\n{results}"
+
+    system_prompt = (
+        "You are Darwin, a Lead Software Architect. \n"
+        "1. FIRST, check if the requested functionality already exists in the CURRENT REPO TREE or HISTORY.\n"
+        "2. If it DOES exist, set 'feature_already_exists' to true and explain why. Leave the rest empty.\n"
+        "3. If it does NOT exist, create a plan to build and TEST it.\n"
+        "AVAILABLE ROLES: 'Frontend Designer', 'Backend Engineer', 'Security Auditor', 'Software Developer'.\n"
+        "CRITICAL: You MUST include at least one step for the Code Agent to write test cases or test scripts for the feature.\n"
+        "Return ONLY JSON matching this structure:\n"
+        "{\n"
+        "  \"feature_already_exists\": false,\n"
+        "  \"duplication_reason\": \"\",\n"
+        "  \"goal\": \"string\",\n"
+        "  \"target_files\": [\"string\"],\n"
+        "  \"implementation_steps\": [{\"agent_role\": \"string\", \"instruction\": \"string\"}],\n"
+        "  \"acceptance_criteria\": [\"string\"]\n"
+        "}"
+    )
+    prompt = f"HISTORY:\n{history}\n\nUSER REQUEST: {raw_prompt}{web_context}\n\nCURRENT REPO TREE:\n{repo_tree}"
+    
+    response = await generate_json(prompt, settings.OLLAMA_MODEL_PLANNING, system_prompt, max_tokens=1500, timeout_sec=90)
+    
+    if "error" in response:
+        raise Exception(f"Planner Error: {response['error']}")
+        
+    plan = AdvancedExecutionPlan(**response)
+    
+    if plan.feature_already_exists:
+        event_bus.emit("ARCHITECT", f"Halted: Feature already exists. {plan.duplication_reason}", level="WARN")
+    else:
+        event_bus.emit("PLANNER", f"Feature validated. Formulated {len(plan.implementation_steps)} implementation step(s).", level="SUCCESS")
+    
+    return plan

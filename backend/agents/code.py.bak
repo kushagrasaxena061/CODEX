@@ -1,0 +1,83 @@
+import logging
+from backend.agents.base import AgentMessage
+from backend.agents.code_schemas import CodeAction
+from backend.llm.ollama_client import generate_json
+from backend.config.settings import settings
+from backend.repository.file_manager import FileManager
+from backend.execution.terminal import Terminal
+from backend.repository.scanner import get_repo_tree
+from backend.events.bus import event_bus
+
+logger = logging.getLogger(__name__)
+
+# Define specialized system instructions
+ROLE_PROMPTS = {
+    "Frontend Designer": "You are an Expert Frontend Designer. Focus entirely on beautiful, responsive, and accessible modern UI using Tailwind CSS. Ensure high-quality aesthetics.",
+    "Backend Engineer": "You are an Expert Backend Engineer. Focus on robust, scalable, and secure architecture using Python, APIs, and clean data modeling.",
+    "Security Auditor": "You are a Strict Security Auditor. Review the codebase for vulnerabilities (SQL injection, XSS, Path Traversal, unhandled exceptions) and implement bulletproof fixes.",
+    "Software Developer": "You are an Expert Software Developer. Write clean, maintainable, and efficient code."
+}
+
+async def implement_step(step_description: str, agent_role: str, files_context: dict, workspace_root: str, history: str = "") -> AgentMessage:
+    event_bus.emit("CODE_AGENT", f"[{agent_role}] Initializing step: {step_description}")
+    repo_tree = get_repo_tree(workspace_root)
+    
+    # Dynamically inject the correct Persona based on the Architect's assignment
+    specialized_persona = ROLE_PROMPTS.get(agent_role, ROLE_PROMPTS["Software Developer"])
+    
+    system_prompt = (
+        f"{specialized_persona}\n"
+        "You MUST output ONLY a VALID JSON object EXACTLY matching this structure:\n"
+        "{\n"
+        "  \"thought_process\": \"string\",\n"
+        "  \"edits\": [{\"file_path\": \"filename.ext\", \"search_block\": \"\", \"replace_block\": \"<INSERT CODE HERE>\"}],\n"
+        "  \"commands\": []\n"
+        "}\n"
+    )
+    
+    context_str = "\n".join([f"--- {path} ---\n{content}" for path, content in files_context.items()])
+    prompt = f"HISTORY:\n{history}\n\nREPOSITORY TREE:\n{repo_tree}\n\nTASK: {step_description}\n\nFILES CONTEXT:\n{context_str}"
+    
+    event_bus.emit("CODE_AGENT", f"[{agent_role}] Synthesizing code edits via LLM...")
+    response = await generate_json(prompt, settings.OLLAMA_MODEL_CODING, system_prompt, max_tokens=3000, timeout_sec=180)
+    
+    if "error" in response:
+        event_bus.emit("CODE_AGENT", f"Code synthesis error: {response['error']}", level="ERROR")
+        return AgentMessage(agent_name=agent_role, status="failed", message=response["error"])
+
+    try:
+        action = CodeAction(**response)
+    except Exception as e:
+        event_bus.emit("CODE_AGENT", f"JSON Schema formatting error: {e}", level="WARN")
+        return AgentMessage(agent_name=agent_role, status="success", message=f"Parse Error: {e}", data={"files_changed": []})
+
+    event_bus.emit("CODE_AGENT", f"Thought: {action.thought_process}")
+
+    fm = FileManager(workspace_root)
+    term = Terminal(workspace_root)
+    applied_edits = []
+    
+    for edit in action.edits:
+        try:
+            current_content = fm.read_file(edit.file_path)
+            if not current_content or not edit.search_block:
+                fm.write_file(edit.file_path, edit.replace_block)
+                applied_edits.append(edit.file_path)
+            elif edit.search_block in current_content:
+                new_content = current_content.replace(edit.search_block, edit.replace_block)
+                fm.write_file(edit.file_path, new_content)
+                applied_edits.append(edit.file_path)
+        except Exception as e:
+            event_bus.emit("CODE_AGENT", f"Failed applying edit to {edit.file_path}: {e}", level="ERROR")
+            
+    cmd_logs = []
+    for cmd in action.commands:
+        event_bus.emit("TERMINAL", f"Executing: {cmd}")
+        res = await term.run(cmd)
+        cmd_logs.append(f"$ {cmd}\nEXIT: {res['exit_code']}\n{res['stdout']}")
+        event_bus.emit("TERMINAL", f"Command exited with code {res['exit_code']}")
+        
+    return AgentMessage(
+        agent_name=agent_role, status="success",
+        message=action.thought_process, data={"files_changed": applied_edits, "terminal_logs": cmd_logs}
+    )

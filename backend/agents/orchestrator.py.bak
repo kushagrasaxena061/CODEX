@@ -1,0 +1,47 @@
+import logging
+from backend.agents.planner import AdvancedExecutionPlan
+from backend.agents.base import AgentMessage
+from backend.agents.code import implement_step
+from backend.agents.verifier import verify_plan
+from backend.agents.debug import generate_fix
+from backend.config.settings import settings
+from backend.repository.file_manager import FileManager
+from backend.events.bus import event_bus
+from backend.execution.cancel_manager import cancel_manager
+
+logger = logging.getLogger(__name__)
+
+class TaskOrchestrator:
+    def __init__(self, plan: AdvancedExecutionPlan, history: str = "", max_iterations: int = 4):
+        self.plan = plan
+        self.history = history
+        self.max_iterations = max_iterations
+
+    async def execute(self) -> AgentMessage:
+        if self.plan.feature_already_exists:
+            return AgentMessage(agent_name="orchestrator", status="duplicate", message=f"Functionality already exists: {self.plan.duplication_reason}")
+
+        fm = FileManager(settings.WORKSPACE_ROOT)
+        
+        iteration = 0
+        while iteration < self.max_iterations:
+            cancel_manager.check()
+            iteration += 1
+            
+            for step in self.plan.implementation_steps:
+                cancel_manager.check()
+                files_context = {f: fm.read_file(f) or "(Empty)" for f in self.plan.target_files}
+                await implement_step(step.instruction, step.agent_role, files_context, settings.WORKSPACE_ROOT, self.history)
+                
+            cancel_manager.check()
+            passed, reason = await verify_plan(self.plan)
+            
+            if passed:
+                return AgentMessage(agent_name="orchestrator", status="success", message="All tests passed. Pending human approval.", data={})
+            else:
+                event_bus.emit("QA_VERIFIER", f"An error came: {reason}. Retrying (Attempt {iteration}/{self.max_iterations})...", level="ERROR")
+                for step in self.plan.implementation_steps:
+                    cancel_manager.check()
+                    step.instruction = await generate_fix(reason, step.instruction)
+                    
+        return AgentMessage(agent_name="orchestrator", status="failed", message="Max retries exceeded without passing tests.")

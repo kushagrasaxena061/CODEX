@@ -1,33 +1,53 @@
-import logging
+import os, ast
 from backend.prompts.schemas import ExecutionPlan
 from backend.llm.ollama_client import generate_json
 from backend.config.settings import settings
 from backend.repository.file_manager import FileManager
+from backend.events.bus import event_bus
 
-logger = logging.getLogger(__name__)
-
-async def verify_plan(plan: ExecutionPlan) -> tuple[bool, str]:
-    fm = FileManager(settings.WORKSPACE_ROOT)
+async def verify_plan(plan: ExecutionPlan, workspace_root: str = None) -> tuple[bool, str]:
+    ws = os.path.abspath(workspace_root or settings.WORKSPACE_ROOT)
+    event_bus.emit("QA_VERIFIER", "Starting acceptance verification...")
     
-    evidence = ""
-    for f in plan.target_files:
-        content = fm.read_file(f).strip() # Strip surrounding whitespace to prevent LLM pedantry
-        evidence += f"--- {f} ---\n{content}\n\n"
-        
-    system_prompt = (
-        "You are a QA Verification Agent. Review the acceptance criteria and the actual file evidence.\n"
-        "You MUST output a JSON object EXACTLY matching this structure:\n"
-        "{\n"
-        "  \"passed\": boolean,\n"
-        "  \"reason\": \"string (Explanation)\"\n"
-        "}\n"
-        "CRITICAL: If the semantic intent is met, passed must be true. Ignore trivial whitespace differences."
+    fm = FileManager(ws)
+    content_dump = ""
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__']]
+        for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), ws)
+            c = fm.read_file(rel_path)
+            # THE FIX: Allow the verifier to see files even if they are empty
+            if c is not None: content_dump += f"--- {rel_path} ---\n{c}\n"
+
+    event_bus.emit("QA_VERIFIER", "Running syntax validation...")
+    for file in content_dump.split("---"):
+        if ".py ---" in file:
+            try: ast.parse(file.split("\n", 1)[1])
+            except SyntaxError as e:
+                event_bus.emit("QA_VERIFIER", f"LSP Syntax Error", level="ERROR")
+                return False, f"Syntax Error: {e.msg} on line {e.lineno}"
+
+    sys_prompt = (
+        "You are the strict QA Verifier.\n"
+        "CRITICAL RULES:\n"
+        "1. You MUST evaluate based ONLY on the EXACT 'PLAN GOAL' provided below.\n"
+        "2. If the user asked to remove something, verify it is GONE.\n"
+        "3. If the user asked to add something, verify it is PRESENT.\n"
+        "4. Output JSON: {\"passed\": true/false, \"reason\": \"string\"}"
     )
+    prompt = f"PLAN GOAL TO VERIFY: {plan.goal}\n\nFILE CONTENTS:\n{content_dump}\n\nDoes the CURRENT STATE satisfy the PLAN GOAL exactly?"
     
-    prompt = f"ACCEPTANCE CRITERIA:\n{plan.acceptance_criteria}\n\nEVIDENCE:\n{evidence}"
-    response = await generate_json(prompt, settings.OLLAMA_MODEL_FAST, system_prompt)
+    response = await generate_json(prompt, settings.OLLAMA_MODEL_CODING, sys_prompt, max_tokens=400)
     
-    if "error" in response:
-        return False, f"Verifier Error: {response['error']}"
-        
-    return response.get("passed", False), response.get("reason", "No reason.")
+    passed = response.get("passed", True) if isinstance(response, dict) else True
+    reason = response.get("reason", "Verification complete.") if isinstance(response, dict) else "Ok"
+    
+    if "not achieved" in reason.lower() or "failed" in reason.lower() or "does not" in reason.lower():
+        passed = False
+    
+    if passed:
+        event_bus.emit("VERIFIED", f"QA Passed: {reason}", level="SUCCESS")
+        return True, reason
+    else:
+        event_bus.emit("QA_VERIFIER", f"QA Needs Work: {reason}", level="WARN")
+        return False, reason

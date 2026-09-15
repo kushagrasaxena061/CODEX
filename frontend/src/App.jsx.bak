@@ -4,6 +4,7 @@ function App() {
   const [conversations, setConversations] = useState([]);
   const [activeConvId, setActiveConvId] = useState(null);
 
+  // THE FIX: True Isolation. Every variable is now a dictionary keyed by the Project/Session ID
   const [prompts, setPrompts] = useState({});
   const [taskPrompts, setTaskPrompts] = useState({});
   const [chats, setChats] = useState({});
@@ -12,30 +13,21 @@ function App() {
   const [tokens, setTokens] = useState({});
   const [allLogs, setAllLogs] = useState({});
 
+  // Rename States
   const [editingConvId, setEditingConvId] = useState(null);
   const [editTitle, setEditTitle] = useState('');
 
   const [showGithubModal, setShowGithubModal] = useState(false);
+  const [showMountModal, setShowMountModal] = useState(false);
+  const [localMountPath, setLocalMountPath] = useState("");
   const [githubUrl, setGithubUrl] = useState('');
   const [githubToken, setGithubToken] = useState('');
-
-  const [showMountModal, setShowMountModal] = useState(false);
-  const [localMountPath, setLocalMountPath] = useState('');
-
-  // THE FIX: Persistent Local Storage States
-  const [mounts, setMounts] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('darwin_mounts')) || {}; }
-    catch(e) { return {}; }
-  });
-  const [gitLinks, setGitLinks] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('darwin_git')) || {}; }
-    catch(e) { return {}; }
-  });
 
   const fileInputRef = useRef(null);
   const chatEndRef = useRef(null);
   const terminalEndRef = useRef(null);
 
+  // Derive current active values for the UI
   const prompt = prompts[activeConvId] || '';
   const currentTaskPrompt = taskPrompts[activeConvId] || '';
   const chat = chats[activeConvId] || [];
@@ -48,36 +40,14 @@ function App() {
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat, status]);
   useEffect(() => { terminalEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
 
-  // THE FIX: Save to LocalStorage automatically
-  useEffect(() => { localStorage.setItem('darwin_mounts', JSON.stringify(mounts)); }, [mounts]);
-  useEffect(() => { localStorage.setItem('darwin_git', JSON.stringify(gitLinks)); }, [gitLinks]);
-
-  // THE FIX: Auto-Remount Failsafe. If the backend restarted, the UI forces it to remember.
-  useEffect(() => {
-    if (activeConvId) {
-      if (mounts[activeConvId]) {
-        fetch("http://localhost:8000/api/workspace/mount", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversation_id: activeConvId, local_path: mounts[activeConvId] })
-        }).catch(() => {});
-      }
-      if (gitLinks[activeConvId]) {
-        fetch("http://localhost:8000/api/github/connect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ conversation_id: activeConvId, repo_url: gitLinks[activeConvId].url, token: gitLinks[activeConvId].token })
-        }).catch(() => {});
-      }
-    }
-  }, [activeConvId, mounts, gitLinks]);
-
   const loadConversations = async () => {
     try {
       const res = await fetch('http://localhost:8000/api/conversations');
       const data = await res.json();
       setConversations(data);
-      if (data.length > 0 && !activeConvId) { selectConversation(data[0].id); }
+      if (data.length > 0 && !activeConvId) {
+        selectConversation(data[0].id);
+      }
     } catch (e) {}
   };
 
@@ -106,7 +76,7 @@ function App() {
       
       setStatuses(prev => {
          const current = prev[id] || 'IDLE';
-         if (current === 'WORKING...') return prev; 
+         if (current === 'WORKING...') return prev; // Do not interrupt active tasks
          if (isAwaiting) return { ...prev, [id]: 'AWAITING REVIEW' };
          if (isWorking) return { ...prev, [id]: 'WORKING...' };
          return { ...prev, [id]: 'IDLE' };
@@ -130,7 +100,10 @@ function App() {
   };
 
   const saveRename = async (id) => {
-    if (!editTitle.trim()) { setEditingConvId(null); return; }
+    if (!editTitle.trim()) {
+      setEditingConvId(null);
+      return;
+    }
     try {
       await fetch(`http://localhost:8000/api/conversations/${id}`, {
         method: 'PATCH',
@@ -148,10 +121,13 @@ function App() {
       await fetch(`http://localhost:8000/api/conversations/${id}`, { method: 'DELETE' });
       const remaining = conversations.filter(c => c.id !== id);
       setConversations(remaining);
-      if (activeConvId === id && remaining.length > 0) { selectConversation(remaining[0].id); }
+      if (activeConvId === id && remaining.length > 0) {
+        selectConversation(remaining[0].id);
+      }
     } catch (e) {}
   };
 
+  // THE FIX: True Concurrency Polling. It pulls live logs for ALL working tabs in the background.
   useEffect(() => {
     const interval = setInterval(async () => {
       const activeIds = Object.keys(statuses).filter(id => statuses[id] === 'WORKING...' || statuses[id] === 'ANALYZING ARCHITECTURE...');
@@ -186,29 +162,6 @@ function App() {
     setStatuses(p => ({...p, [targetId]: 'IDLE'}));
   };
 
-  const handleBrowse = async () => {
-    try {
-      const res = await fetch("http://localhost:8000/api/workspace/pick_folder");
-      const data = await res.json();
-      if (data.path) { setLocalMountPath(data.path); }
-    } catch (e) {}
-  };
-
-  const handleMount = async () => {
-    const targetId = activeConvId;
-    if (!localMountPath || !targetId) return;
-    try {
-      await fetch("http://localhost:8000/api/workspace/mount", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversation_id: targetId, local_path: localMountPath })
-      });
-      setShowMountModal(false);
-      setMounts(p => ({...p, [targetId]: localMountPath})); // Save globally
-      setChats(p => ({...p, [targetId]: [...(p[targetId]||[]), { role: "system", content: `Local folder mounted: ${localMountPath}. Edits will sync live to your hard drive.` }]}));
-    } catch (e) {}
-  };
-
   const handleDownload = () => {
     if (activeConvId) window.open(`http://localhost:8000/api/workspace/download?conversation_id=${activeConvId}`, '_blank');
   };
@@ -222,7 +175,7 @@ function App() {
         body: JSON.stringify({ conversation_id: activeConvId, repo_url: githubUrl, token: githubToken })
       });
       setShowGithubModal(false);
-      setGitLinks(p => ({...p, [activeConvId]: { url: githubUrl, token: githubToken }})); // Save globally
+      setConversations(prev => prev.map(c => c.id === activeConvId ? { ...c, github_connected: true } : c));
       const username = githubUrl.split('/')[3] || 'GitHub';
       setChats(p => ({...p, [activeConvId]: [...(p[activeConvId]||[]), { role: 'system', content: `Connected to ${username} for this project.` }]}));
     } catch (e) {}
@@ -254,20 +207,6 @@ function App() {
     setStatuses(p => ({...p, [targetId]: 'IDLE'}));
   };
 
-  const killProcess = async () => {
-    const targetId = activeConvId;
-    if (!targetId) return;
-    setStatuses(p => ({...p, [targetId]: 'IDLE'}));
-    setChats(p => ({...p, [targetId]: [...(p[targetId]||[]), { role: 'system', content: 'Process forcefully killed by user. Task aborted.' }]}));
-    try {
-      await fetch('http://localhost:8000/api/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversation_id: targetId })
-      });
-    } catch (e) {}
-  };
-
   const sendPrompt = async (forcedPrompt = null) => {
     const targetId = activeConvId;
     const textToSend = forcedPrompt || prompt;
@@ -286,6 +225,7 @@ function App() {
       });
       const data = await res.json();
 
+      // Final telemetry fetch for this specific chat
       try {
           const lRes = await fetch(`http://localhost:8000/api/logs/live?conversation_id=${targetId}`);
           const lData = await lRes.json();
@@ -295,23 +235,19 @@ function App() {
           setTokens(p => ({...p, [targetId]: tData.tokens}));
       } catch(e){}
 
-      setStatuses(p => {
-        if(p[targetId] === 'IDLE') return p; 
-        
-        if (data.status === 'duplicate') {
-          setChats(c => ({...c, [targetId]: [...(c[targetId]||[]), { role: 'system', content: `Feature already exists: ${data.message}` }]}));
-          return {...p, [targetId]: 'IDLE'};
-        } else if (data.status === 'requires_approval') {
-          setChats(c => ({...c, [targetId]: [...(c[targetId]||[]), { role: 'system', content: data.message }]}));
-          setApprovals(a => ({...a, [targetId]: true}));
-          return {...p, [targetId]: 'AWAITING REVIEW'};
-        } else {
-          setChats(c => ({...c, [targetId]: [...(c[targetId]||[]), { role: 'system', content: data.message }]}));
-          return {...p, [targetId]: 'IDLE'};
-        }
-      });
+      if (data.status === 'duplicate') {
+        setChats(p => ({...p, [targetId]: [...(p[targetId]||[]), { role: 'system', content: `Feature already exists: ${data.message}` }]}));
+        setStatuses(p => ({...p, [targetId]: 'IDLE'}));
+      } else if (data.status === 'requires_approval') {
+        setChats(p => ({...p, [targetId]: [...(p[targetId]||[]), { role: 'system', content: data.message }]}));
+        setApprovals(p => ({...p, [targetId]: true}));
+        setStatuses(p => ({...p, [targetId]: 'AWAITING REVIEW'}));
+      } else {
+        setChats(p => ({...p, [targetId]: [...(p[targetId]||[]), { role: 'system', content: data.message }]}));
+        setStatuses(p => ({...p, [targetId]: 'IDLE'}));
+      }
     } catch (e) {
-      setStatuses(p => p[targetId] !== 'IDLE' ? ({...p, [targetId]: 'IDLE'}) : p);
+      setStatuses(p => ({...p, [targetId]: 'IDLE'}));
     }
   };
 
@@ -322,12 +258,8 @@ function App() {
     if (tag === 'CODE_AGENT') return 'bg-blue-500/20 text-blue-300 border-blue-500/30';
     if (tag === 'PLANNER' || tag === 'ARCHITECT') return 'bg-purple-500/20 text-purple-300 border-purple-500/30';
     if (tag === 'VISION_AGENT') return 'bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30';
-    if (tag === 'TERMINAL') return 'bg-orange-500/20 text-orange-300 border-orange-500/30';
     return 'bg-zinc-800/80 text-zinc-300 border-zinc-700/50';
   };
-
-  const currentMount = mounts[activeConvId];
-  const isGitConnected = gitLinks[activeConvId] || activeConv?.github_connected;
 
   return (
     <div className="flex h-screen bg-[#030303] text-[#ececf1] font-sans antialiased overflow-hidden selection:bg-indigo-500/30 relative">
@@ -349,29 +281,7 @@ function App() {
         </div>
       )}
 
-      {showMountModal && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
-          <div className="bg-[#0c0c0e] border border-white/10 rounded-2xl p-7 w-[420px] shadow-2xl flex flex-col gap-4">
-            <h2 className="text-base font-bold text-white flex items-center gap-2">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-              Mount Local Directory
-            </h2>
-            <p className="text-xs text-zinc-400">Select a folder on your Mac directly. DARWIN will edit files live on your hard drive.</p>
-            
-            <div className="flex gap-2">
-              <input type="text" placeholder="/Users/yourname/Projects/MyApp" value={localMountPath} onChange={e => setLocalMountPath(e.target.value)} className="flex-1 bg-[#18181b] p-3 rounded-xl border border-white/10 text-sm outline-none focus:border-indigo-500 transition-all" />
-              <button onClick={handleBrowse} className="px-4 py-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-zinc-300 text-sm font-semibold transition-all">Browse...</button>
-            </div>
-
-            <div className="flex justify-end gap-3 mt-4">
-              <button onClick={() => setShowMountModal(false)} className="px-5 py-2.5 rounded-xl text-xs font-semibold text-zinc-400 hover:text-white transition-colors">Cancel</button>
-              <button onClick={handleMount} className="px-5 py-2.5 rounded-xl text-xs font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/30 transition-all">Mount Live Folder</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sidebar */}
+      {/* Project Sessions Sidebar */}
       <div className="w-64 bg-[#09090b] border-r border-white/5 flex flex-col shrink-0 z-20 shadow-xl">
         <div className="h-16 px-5 border-b border-white/5 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -380,7 +290,7 @@ function App() {
             </div>
             <span className="font-bold tracking-widest text-xs text-white">DARWIN</span>
           </div>
-          <button onClick={createNewSession} className="p-1.5 rounded-lg text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/5 transition-all shadow-sm">
+          <button onClick={createNewSession} className="p-1.5 rounded-lg text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/5 transition-all shadow-sm" title="New Session">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           </button>
         </div>
@@ -388,18 +298,39 @@ function App() {
         <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-2">
           <span className="text-[10px] font-bold text-zinc-500 px-2 py-1 uppercase tracking-widest mb-1">Projects / Sessions</span>
           {conversations.map(conv => (
-            <div key={conv.id} onClick={() => { if (editingConvId !== conv.id) selectConversation(conv.id); }} className={`group relative flex items-center justify-between px-3 py-3 rounded-xl text-sm cursor-pointer transition-all duration-300 ${conv.id === activeConvId ? 'bg-indigo-500/10 border border-indigo-500/20 text-indigo-100' : 'text-zinc-400 hover:bg-white/[0.04] hover:text-zinc-200 border border-transparent'}`}>
+            <div
+              key={conv.id}
+              onClick={() => { if (editingConvId !== conv.id) selectConversation(conv.id); }}
+              className={`group relative flex items-center justify-between px-3 py-3 rounded-xl text-sm cursor-pointer transition-all duration-300 ${
+                conv.id === activeConvId
+                  ? 'bg-indigo-500/10 border border-indigo-500/20 text-indigo-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]'
+                  : 'text-zinc-400 hover:bg-white/[0.04] hover:text-zinc-200 border border-transparent'
+              }`}
+            >
               {editingConvId === conv.id ? (
-                <input autoFocus value={editTitle} onChange={e => setEditTitle(e.target.value)} onBlur={() => saveRename(conv.id)} onKeyDown={e => { if(e.key === 'Enter') saveRename(conv.id); if(e.key === 'Escape') setEditingConvId(null); }} className="bg-black/40 text-white text-xs px-2 py-1 rounded outline-none border border-indigo-500/50 w-full shadow-inner"/>
+                <input 
+                  autoFocus 
+                  value={editTitle} 
+                  onChange={e => setEditTitle(e.target.value)} 
+                  onBlur={() => saveRename(conv.id)} 
+                  onKeyDown={e => { if(e.key === 'Enter') saveRename(conv.id); if(e.key === 'Escape') setEditingConvId(null); }} 
+                  className="bg-black/40 text-white text-xs px-2 py-1 rounded outline-none border border-indigo-500/50 w-full shadow-inner"
+                />
               ) : (
                 <>
                   <div className="flex items-center gap-3 truncate">
-                    <span className={`w-2 h-2 rounded-full shadow-sm ${gitLinks[conv.id] || conv.github_connected ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-zinc-600'}`}></span>
+                    <span className={`w-2 h-2 rounded-full shadow-sm ${conv.github_connected ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-zinc-600'}`}></span>
                     <span className="truncate font-medium">{conv.title}</span>
                   </div>
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button onClick={(e) => startEditing(e, conv)} className="p-1.5 text-zinc-500 hover:text-indigo-400 rounded-md hover:bg-white/5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg></button>
-                    {conversations.length > 1 && (<button onClick={(e) => deleteSession(e, conv.id)} className="p-1.5 text-zinc-500 hover:text-rose-400 rounded-md hover:bg-white/5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>)}
+                    <button onClick={(e) => startEditing(e, conv)} className="p-1.5 text-zinc-500 hover:text-indigo-400 rounded-md hover:bg-white/5">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
+                    </button>
+                    {conversations.length > 1 && (
+                      <button onClick={(e) => deleteSession(e, conv.id)} className="p-1.5 text-zinc-500 hover:text-rose-400 rounded-md hover:bg-white/5">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                      </button>
+                    )}
                   </div>
                 </>
               )}
@@ -418,45 +349,24 @@ function App() {
               <span className="text-[10px] font-bold text-amber-400 tracking-widest">{tokensUsed.toLocaleString()} TOKENS</span>
             </div>
           </div>
+
           <div className="flex gap-3">
-            
-            {/* THE FIX: Dynamic GitHub Connected State */}
-            {isGitConnected ? (
-              <div className="flex gap-2">
-                <div className="px-4 py-2 rounded-lg text-xs font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-2 shadow-[0_0_10px_rgba(16,185,129,0.1)] cursor-default">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg> GitHub Connected
-                </div>
-                <button onClick={() => setGitLinks(p => { const n = {...p}; delete n[activeConvId]; return n; })} className="px-3 py-2 rounded-lg text-zinc-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center justify-center shadow-sm" title="Disconnect GitHub">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg>
-                </button>
+            {activeConv?.github_connected ? (
+              <div className="px-4 py-2 rounded-lg text-xs font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-2 shadow-[0_0_10px_rgba(16,185,129,0.1)] cursor-default">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                GitHub Connected
               </div>
             ) : (
               <button onClick={() => setShowGithubModal(true)} className="px-4 py-2 rounded-lg text-xs font-semibold text-zinc-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center gap-2 shadow-sm">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg> Connect GitHub
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+                Connect GitHub
               </button>
             )}
-
             <input type="file" ref={fileInputRef} onChange={handleUpload} accept=".zip" className="hidden" />
             <button onClick={() => fileInputRef.current.click()} className="px-4 py-2 rounded-lg text-xs font-semibold text-zinc-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center gap-2 shadow-sm">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> Upload
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload Workspace
             </button>
-            
-            {/* THE FIX: Persistent Mount Button UI */}
-            {currentMount ? (
-              <div className="flex gap-2">
-                <div className="px-4 py-2 rounded-lg text-xs font-bold text-indigo-400 bg-indigo-500/10 border border-indigo-500/30 flex items-center gap-2 shadow-[0_0_10px_rgba(99,102,241,0.1)] cursor-default">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-                  {currentMount.split('/').filter(Boolean).pop()} Mounted
-                </div>
-                <button onClick={() => setShowMountModal(true)} className="px-3 py-2 rounded-lg text-zinc-300 bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center justify-center shadow-sm" title="Change Folder">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-                </button>
-              </div>
-            ) : (
-              <button onClick={() => setShowMountModal(true)} className="px-4 py-2 rounded-lg text-xs font-semibold text-zinc-300 bg-indigo-500/10 hover:bg-indigo-500/20 border border-indigo-500/30 transition-all flex items-center gap-2 shadow-sm">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg> Mount Local Folder
-              </button>
-            )}
           </div>
         </header>
 
@@ -471,6 +381,17 @@ function App() {
                </div>
                <h1 className="text-3xl font-light text-white mb-2 tracking-wide">Welcome to <span className="font-bold">DARWIN</span></h1>
                <p className="text-zinc-400 mb-10 max-w-sm text-center text-sm leading-relaxed">Your autonomous AI software engineer. Select a prompt below or start typing to begin building.</p>
+               
+               <div className="grid grid-cols-2 gap-4 w-full max-w-2xl">
+                  <div onClick={() => sendPrompt("Build a sleek dark mode dashboard with Tailwind CSS")} className="p-5 rounded-2xl bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:border-white/10 transition-all cursor-pointer group">
+                     <h3 className="text-zinc-200 font-semibold text-sm mb-1 group-hover:text-indigo-300">Frontend UI</h3>
+                     <p className="text-zinc-500 text-xs leading-relaxed">Build a sleek dark mode dashboard with Tailwind CSS</p>
+                  </div>
+                  <div onClick={() => sendPrompt("Create a REST API with FastAPI and SQLite")} className="p-5 rounded-2xl bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:border-white/10 transition-all cursor-pointer group">
+                     <h3 className="text-zinc-200 font-semibold text-sm mb-1 group-hover:text-indigo-300">Backend API</h3>
+                     <p className="text-zinc-500 text-xs leading-relaxed">Create a REST API with FastAPI and SQLite</p>
+                  </div>
+               </div>
             </div>
           ) : (
             chat.map((msg, i) => (
@@ -481,8 +402,12 @@ function App() {
                   </div>
                 )}
                 <div className={`relative max-w-[80%] text-[14.5px] leading-relaxed p-5 shadow-lg ${
-                  msg.role === 'user' ? 'bg-gradient-to-b from-zinc-800 to-zinc-900 text-zinc-100 rounded-2xl rounded-tr-sm border border-zinc-700' : 'bg-[#121216]/80 backdrop-blur-sm text-zinc-300 rounded-2xl rounded-tl-sm border border-white/5'
-                }`}>{msg.content}</div>
+                  msg.role === 'user'
+                    ? 'bg-gradient-to-b from-zinc-800 to-zinc-900 text-zinc-100 rounded-2xl rounded-tr-sm border border-zinc-700'
+                    : 'bg-[#121216]/80 backdrop-blur-sm text-zinc-300 rounded-2xl rounded-tl-sm border border-white/5'
+                }`}>
+                  {msg.content}
+                </div>
               </div>
             ))
           )}
@@ -505,9 +430,15 @@ function App() {
           <div className="w-full max-w-3xl flex flex-col gap-4">
             {needsApproval && (
               <div className="flex gap-3 justify-center bg-black/40 backdrop-blur-xl p-3 rounded-2xl border border-white/10 shadow-2xl">
-                <button onClick={() => handleDecision('reject')} className="px-5 py-2.5 rounded-xl bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 border border-rose-500/30 text-xs font-bold transition-all shadow-sm">Reject & Rollback</button>
-                <button onClick={handleDownload} className="px-5 py-2.5 rounded-xl bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/30 text-xs font-bold transition-all shadow-sm">Export Local Test</button>
-                <button onClick={() => handleDecision('approve')} className="px-5 py-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-bold transition-all shadow-[0_0_15px_rgba(16,185,129,0.15)]">Approve & Commit</button>
+                <button onClick={() => handleDecision('reject')} className="px-5 py-2.5 rounded-xl bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 border border-rose-500/30 text-xs font-bold transition-all shadow-sm">
+                  Reject & Rollback
+                </button>
+                <button onClick={handleDownload} className="px-5 py-2.5 rounded-xl bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 border border-blue-500/30 text-xs font-bold transition-all shadow-sm">
+                  Export Local Test
+                </button>
+                <button onClick={() => handleDecision('approve')} className="px-5 py-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-bold transition-all shadow-[0_0_15px_rgba(16,185,129,0.15)]">
+                  Approve & Commit
+                </button>
               </div>
             )}
 
@@ -521,13 +452,7 @@ function App() {
                 disabled={status !== 'IDLE' && !needsApproval}
                 rows={1}
               />
-              <div className="p-3 flex gap-2">
-                {(status === 'WORKING...' || status === 'ANALYZING ARCHITECTURE...') && (
-                  <button onClick={killProcess} className="p-3 rounded-xl bg-rose-500/20 text-rose-500 hover:bg-rose-500/30 transition-all" title="Kill Process">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>
-                  </button>
-                )}
-                
+              <div className="p-3">
                 <button onClick={() => sendPrompt()} disabled={status !== 'IDLE' || !prompt.trim()} className="p-3 rounded-xl bg-white text-black hover:bg-zinc-200 disabled:opacity-20 transition-all">
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
                 </button>
@@ -537,7 +462,7 @@ function App() {
         </div>
       </div>
 
-      {/* Terminal */}
+      {/* Terminal Telemetry */}
       <div className="w-[440px] bg-[#000000] border-l border-white/5 flex flex-col z-20 shrink-0 shadow-2xl">
         <div className="h-16 px-5 border-b border-white/5 flex items-center justify-between bg-[#030303]">
           <span className="text-[11px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">

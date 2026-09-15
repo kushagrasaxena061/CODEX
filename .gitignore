@@ -7,3 +7,6 @@ node_modules/
 
 # Security - Ignore GitHub Tokens
 backend/github_remote.txt
+
+# Ignore AI Sandbox
+workspace/
